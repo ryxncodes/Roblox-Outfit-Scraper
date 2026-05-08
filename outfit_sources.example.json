@@ -1,0 +1,10 @@
+{
+  "sources": [
+    {
+      "groupId": 123456,
+      "ranks": [200, 250, 255],
+      "maxUsersPerRank": 250,
+      "maxOutfitsPerUser": 20
+    }
+  ]
+}
