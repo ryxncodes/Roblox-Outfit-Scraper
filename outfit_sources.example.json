@@ -6,5 +6,13 @@
       "maxUsersPerRank": 250,
       "maxOutfitsPerUser": 20
     }
-  ]
+  ],
+  "filters": {
+    "avatarTypes": ["R6"],
+    "requireAssetTypes": ["Shirt", "Pants"],
+    "excludeAssetTypes": ["JacketAccessory", "SweaterAccessory"],
+    "includeKeywords": ["emo", "black"],
+    "excludeKeywords": ["korblox", "headless"],
+    "allowDefaultClothing": false
+  }
 }
