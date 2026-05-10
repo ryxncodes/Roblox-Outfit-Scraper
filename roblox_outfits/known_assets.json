@@ -1,0 +1,10 @@
+{
+  "headless": {
+    "assetIds": [134082579],
+    "nameHints": ["headless head", "headless"]
+  },
+  "korblox": {
+    "assetIds": [139607718],
+    "nameHints": ["korblox", "deathspeaker"]
+  }
+}

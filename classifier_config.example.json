@@ -1,0 +1,17 @@
+{
+  "workspace": ".workspace",
+  "thumbnailSize": "420x420",
+  "modelPath": ".workspace/models/metadata_model.joblib",
+  "useMetadataModel": true,
+  "useImageModel": false,
+  "styleThreshold": 0.55,
+  "reviewThreshold": 0.70,
+  "topStyles": 3,
+  "knownAssetConfigPath": "roblox_outfits/known_assets.json",
+  "styleHintsPath": "roblox_outfits/style_hints.json",
+  "defaultExport": {
+    "format": "lua",
+    "approvedOnly": true,
+    "includeClassification": true
+  }
+}

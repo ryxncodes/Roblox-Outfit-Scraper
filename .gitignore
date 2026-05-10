@@ -1,0 +1,14 @@
+.cache/
+__pycache__/
+.pytest_cache/
+.workspace/
+*.sqlite
+*.sqlite3
+*.db
+*.joblib
+*.pkl
+*.pt
+*.pth
+*.onnx
+outfit_sources.json
+tmp*

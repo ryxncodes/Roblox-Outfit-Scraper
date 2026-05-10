@@ -70,6 +70,7 @@ class RobloxClient:
         self.cache_dir = cache_dir
         self.cache_hits = 0
         self.cache_misses = 0
+        self.rate_limit_hits = 0
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -101,7 +102,8 @@ class RobloxClient:
                     return payload
             except urllib.error.HTTPError as exc:
                 if exc.code == 429 and attempt < self.max_retries:
-                    self._sleep_after_rate_limit(exc, attempt)
+                    self.rate_limit_hits += 1
+                    self._sleep_after_rate_limit(exc, attempt, url)
                     continue
                 if 500 <= exc.code <= 599 and attempt < self.max_retries:
                     self._sleep_backoff(attempt)
@@ -150,7 +152,7 @@ class RobloxClient:
             time.sleep(wait)
         self.last_request_at = time.monotonic()
 
-    def _sleep_after_rate_limit(self, exc: urllib.error.HTTPError, attempt: int) -> None:
+    def _sleep_after_rate_limit(self, exc: urllib.error.HTTPError, attempt: int, url: str) -> None:
         retry_after = exc.headers.get("retry-after")
         reset_after = exc.headers.get("x-ratelimit-reset")
 
@@ -165,7 +167,11 @@ class RobloxClient:
                 continue
 
         if delay is None:
-            delay = self._backoff_seconds(attempt)
+            delay = self._rate_limit_backoff_seconds(attempt)
+            if "/v2/avatar/users/" in url and "/outfits" in url:
+                delay *= 1.5
+        self._adapt_after_rate_limit(delay)
+        print(f"Rate limited by Roblox; waiting {delay:.1f}s and slowing future requests.", file=sys.stderr)
         time.sleep(delay)
 
     def _sleep_backoff(self, attempt: int) -> None:
@@ -174,6 +180,13 @@ class RobloxClient:
     @staticmethod
     def _backoff_seconds(attempt: int) -> float:
         return min(60.0, (2**attempt) + random.uniform(0.0, 0.75))
+
+    @staticmethod
+    def _rate_limit_backoff_seconds(attempt: int) -> float:
+        return min(300.0, 15.0 * (2**attempt) + random.uniform(0.0, 3.0))
+
+    def _adapt_after_rate_limit(self, delay: float) -> None:
+        self.min_delay = min(max(self.min_delay * 1.75, delay / 4.0, 1.0), 15.0)
 
 
 def read_config(path: Path) -> dict[str, Any]:
@@ -189,14 +202,29 @@ def parse_sources(config: dict[str, Any], args: argparse.Namespace) -> list[Sour
         raw_ranks = raw.get("ranks", [])
         ranks = tuple(int(rank) for rank in raw_ranks if isinstance(rank, int) or str(rank).isdigit())
         role_names = tuple(str(rank) for rank in raw_ranks if not (isinstance(rank, int) or str(rank).isdigit()))
-        role_names = role_names + _tuple_of_strings(raw.get("roleNames"))
+        role_names = (
+            role_names
+            + _tuple_of_strings(raw.get("roleNames"))
+            + _tuple_of_strings(raw.get("rankNames"))
+            + _tuple_of_strings(raw.get("roleName"))
+            + _tuple_of_strings(raw.get("rankName"))
+        )
+        if not ranks and not role_names:
+            raise SystemExit(
+                f"Source for group {group_id} has no ranks or role names. "
+                "Use ranks, roleNames, or rankNames."
+            )
         sources.append(
             Source(
                 group_id=group_id,
                 ranks=ranks,
                 role_names=role_names,
-                max_users_per_rank=_optional_int(raw.get("maxUsersPerRank")),
-                max_outfits_per_user=_optional_int(raw.get("maxOutfitsPerUser")),
+                max_users_per_rank=args.max_users_per_rank
+                if args.max_users_per_rank is not None
+                else _optional_int(raw.get("maxUsersPerRank")),
+                max_outfits_per_user=args.max_outfits_per_user
+                if args.max_outfits_per_user is not None
+                else _optional_int(raw.get("maxOutfitsPerUser")),
             )
         )
 
@@ -412,6 +440,22 @@ def asset_type_name(asset: dict[str, Any]) -> str:
     return ""
 
 
+def normalized_assets(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    assets: list[dict[str, Any]] = []
+    for asset in payload.get("assets", []):
+        asset_id = asset.get("id")
+        if not isinstance(asset_id, int):
+            continue
+        assets.append(
+            {
+                "id": asset_id,
+                "name": str(asset.get("name", "")),
+                "assetTypeName": asset_type_name(asset),
+            }
+        )
+    return assets
+
+
 def avatar_type(payload: dict[str, Any]) -> str:
     value = str(payload.get("playerAvatarType", "")).upper()
     return value if value else "unknown"
@@ -489,9 +533,13 @@ def collect(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
         "savedOutfitsMatchingCurrent": 0,
         "duplicatesSkipped": 0,
         "filteredOut": 0,
+        "rateLimitedSkipped": 0,
+        "requestErrorsSkipped": 0,
+        "alreadyScannedSkipped": 0,
         "outfitsWritten": 0,
         "cacheHits": 0,
         "cacheMisses": 0,
+        "rateLimitHits": 0,
         "missingRanks": [],
     }
 
@@ -527,8 +575,18 @@ def collect(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
                 username = user.get("username") or user.get("name")
                 if not isinstance(user_id, int):
                     continue
+                if should_skip_user(args, user_id, source.group_id, rank, role.get("name", ""), args.mode):
+                    stats["alreadyScannedSkipped"] += 1
+                    continue
 
-                current_avatar = get_current_avatar(client, user_id)
+                try:
+                    current_avatar = get_current_avatar(client, user_id)
+                except RuntimeError as exc:
+                    if args.continue_on_request_error:
+                        stats[_request_error_stat(exc)] += 1
+                        print(f"Skipping current avatar for user {user_id}: {exc}", file=sys.stderr)
+                        continue
+                    raise
                 current_signature = avatar_signature(current_avatar)
                 if not current_signature:
                     continue
@@ -553,8 +611,10 @@ def collect(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
                     "currentMatch": True,
                     "avatarType": avatar_type(current_avatar),
                     "assetIds": asset_ids_from_signature(current_signature),
+                    "assets": normalized_assets(current_avatar),
                 }
                 current_entry["tags"] = deterministic_tags(current_entry, current_avatar, filters)
+                emit_collected_entry(args, current_entry)
                 stats["currentAvatarsFound"] += 1
 
                 if args.mode == "current-only":
@@ -562,14 +622,40 @@ def collect(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
                         stats["duplicatesSkipped"] += 1
                     else:
                         found[current_signature] = current_entry
+                    emit_user_scan(args, user_id, source.group_id, rank, role.get("name", ""), "current", "complete")
                     continue
 
-                outfits = get_user_outfits(
-                    client=client,
-                    user_id=user_id,
-                    max_outfits=source.max_outfits_per_user,
-                    max_pages=args.max_outfit_pages,
-                )
+                saved_scan_status = "complete"
+                saved_scan_message = None
+                try:
+                    outfits = get_user_outfits(
+                        client=client,
+                        user_id=user_id,
+                        max_outfits=source.max_outfits_per_user,
+                        max_pages=args.max_outfit_pages,
+                    )
+                except RuntimeError as exc:
+                    if args.continue_on_request_error:
+                        stats[_request_error_stat(exc)] += 1
+                        emit_user_scan(
+                            args,
+                            user_id,
+                            source.group_id,
+                            rank,
+                            role.get("name", ""),
+                            "saved",
+                            "partial",
+                            str(exc),
+                        )
+                        saved_scan_status = "partial"
+                        saved_scan_message = str(exc)
+                        print(
+                            f"Skipping saved outfits for user {user_id}; keeping current avatar: {exc}",
+                            file=sys.stderr,
+                        )
+                        outfits = []
+                    else:
+                        raise
                 stats["outfitsFoundBeforeValidation"] += len(outfits)
 
                 best_current_entry = current_entry
@@ -577,7 +663,14 @@ def collect(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
 
                 for outfit in outfits:
                     outfit_id = outfit["id"]
-                    details = get_outfit_details(client, outfit_id)
+                    try:
+                        details = get_outfit_details(client, outfit_id)
+                    except RuntimeError as exc:
+                        if args.continue_on_request_error:
+                            stats[_request_error_stat(exc)] += 1
+                            print(f"Skipping saved outfit {outfit_id}: {exc}", file=sys.stderr)
+                            continue
+                        raise
                     stats["savedOutfitDetailsScanned"] += 1
                     saved_signature = avatar_signature(details)
                     if not saved_signature:
@@ -614,8 +707,10 @@ def collect(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
                         "currentMatch": saved_signature == current_signature,
                         "avatarType": avatar_type(details),
                         "assetIds": asset_ids_from_signature(saved_signature),
+                        "assets": normalized_assets(details),
                     }
                     saved_entry["tags"] = deterministic_tags(saved_entry, details, filters)
+                    emit_collected_entry(args, saved_entry)
 
                     if saved_signature == current_signature and best_current_entry["source"] != SOURCE_SAVED:
                         best_current_entry = saved_entry
@@ -633,6 +728,16 @@ def collect(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
                         stats["duplicatesSkipped"] += 1
                         continue
                     found[saved_signature] = saved_entry
+                emit_user_scan(
+                    args,
+                    user_id,
+                    source.group_id,
+                    rank,
+                    role.get("name", ""),
+                    "saved",
+                    saved_scan_status,
+                    saved_scan_message,
+                )
 
     if args.validate_thumbnails and found:
         saved_ids = [entry["outfitId"] for entry in found.values() if entry.get("source") == SOURCE_SAVED]
@@ -659,6 +764,7 @@ def collect(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, A
     stats["outfitsWritten"] = len(entries)
     stats["cacheHits"] = client.cache_hits
     stats["cacheMisses"] = client.cache_misses
+    stats["rateLimitHits"] = client.rate_limit_hits
     return entries, stats, rejected
 
 
@@ -687,7 +793,50 @@ def rejected_entry(
         "name": outfit_name,
         "avatarType": avatar_type(payload),
         "assetIds": asset_ids_from_signature(signature),
+        "assets": normalized_assets(payload),
     }
+
+
+def _request_error_stat(exc: RuntimeError) -> str:
+    message = str(exc)
+    if "HTTP 429" in message or "Too many requests" in message:
+        return "rateLimitedSkipped"
+    return "requestErrorsSkipped"
+
+
+def emit_collected_entry(args: argparse.Namespace, entry: dict[str, Any]) -> None:
+    callback = getattr(args, "entry_callback", None)
+    if callable(callback):
+        callback(entry)
+
+
+def should_skip_user(
+    args: argparse.Namespace,
+    user_id: int,
+    group_id: int,
+    rank: int,
+    role_name: str,
+    mode: str,
+) -> bool:
+    callback = getattr(args, "skip_user_callback", None)
+    if callable(callback):
+        return bool(callback(user_id, group_id, rank, role_name, "current" if mode == "current-only" else "saved"))
+    return False
+
+
+def emit_user_scan(
+    args: argparse.Namespace,
+    user_id: int,
+    group_id: int,
+    rank: int,
+    role_name: str,
+    scan_type: str,
+    status: str,
+    message: str | None = None,
+) -> None:
+    callback = getattr(args, "user_scan_callback", None)
+    if callable(callback):
+        callback(user_id, group_id, rank, role_name, scan_type, status, message)
 
 
 def write_lua(entries: list[dict[str, Any]], path: Path, include_metadata: bool) -> None:
@@ -896,6 +1045,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--thumbnail-batch-size", type=int, default=100, help="Thumbnail validation batch size.")
     parser.add_argument("--requests-per-minute", type=int, default=90, help="Soft request cap before 429 handling.")
     parser.add_argument("--max-retries", type=int, default=6, help="Retries for 429 and transient server errors.")
+    parser.add_argument(
+        "--continue-on-request-error",
+        action="store_true",
+        help="Skip users/outfits that still fail after retries instead of aborting the whole run.",
+    )
     parser.add_argument("--timeout", type=float, default=20.0, help="Request timeout in seconds.")
     parser.add_argument(
         "--user-agent",
